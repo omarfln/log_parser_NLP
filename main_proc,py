@@ -1,0 +1,139 @@
+import json
+import re
+import torch
+import nltk
+import numpy as np
+from transformers import T5ForConditionalGeneration, T5Tokenizer
+from torch.utils.data import Dataset, DataLoader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
+
+nltk.download('all')
+#nltk.download('stopwords')
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+
+def load_training_data():
+    return [
+        {"error": "make: *** Compilation failed", "fix": "Check for syntax errors. Ensure all object files are built before linking."},
+        {"error": "Vivado synthesis error: missing net in design", "fix": "Ensure all ports are correctly declared and connected in the RTL module."},
+        {"error": "Verilator fatal error: Cannot resolve signal 'rst'", "fix": "Verify that 'rst' is properly declared as an input in all module instances."},
+        {"error": "ToolX: Unexpected segmentation fault in simulation", "fix": "Check for uninitialized variables and out-of-bounds errors in your simulation code."}
+    ]
+
+failure_data = load_training_data()
+error_messages = [entry["error"] for entry in failure_data]
+fix_suggestions = [entry["fix"] for entry in failure_data]
+
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)  
+    words = word_tokenize(text)
+    words = [word for word in words if word not in stopwords.words('english')]
+    return ' '.join(words)
+
+preprocessed_logs = [preprocess_text(log) for log in error_messages]
+
+vectorizer = TfidfVectorizer()
+log_features = vectorizer.fit_transform(preprocessed_logs)
+
+class FixDataset(Dataset):
+    def __init__(self, errors, fixes, tokenizer, max_length=128):
+        self.errors = errors
+        self.fixes = fixes
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.errors)
+
+    def __getitem__(self, idx):
+        inputs = self.tokenizer(
+            f"error: {self.errors[idx]}", 
+            max_length=self.max_length, 
+            padding="max_length",  
+            truncation=True, 
+            return_tensors="pt"
+        )
+        labels = self.tokenizer(
+            self.fixes[idx], 
+            max_length=self.max_length, 
+            padding="max_length",  
+            truncation=True, 
+            return_tensors="pt"
+        )
+        
+        return {
+            "input_ids": inputs["input_ids"].squeeze(0),  
+            "attention_mask": inputs["attention_mask"].squeeze(0),
+            "labels": labels["input_ids"].squeeze(0)
+        }
+
+train_errors, val_errors, train_fixes, val_fixes = train_test_split(error_messages, fix_suggestions, test_size=0.2, random_state=42)
+tokenizer = T5Tokenizer.from_pretrained("t5-base")
+train_dataset = FixDataset(train_errors, train_fixes, tokenizer)
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+fix_model = T5ForConditionalGeneration.from_pretrained("t5-base").to(device)
+optimizer = torch.optim.AdamW(fix_model.parameters(), lr=5e-5)
+
+def train_fix_model(epochs=50):
+    fix_model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
+            
+            labels[labels == tokenizer.pad_token_id] = -100
+
+            outputs = fix_model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                labels=labels
+            )
+            
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"[Debug]: Epoch {epoch + 1}: Training Loss = {total_loss:.4f}")
+
+train_fix_model()
+
+def analyze_log(new_log):
+    processed_log = preprocess_text(new_log)
+    new_vector = vectorizer.transform([processed_log]).toarray()
+
+    similarities = cosine_similarity(new_vector, log_features)
+    most_similar_index = similarities.argmax()
+    closest_known_error = error_messages[most_similar_index]
+
+    fix_model.eval()
+    inputs = tokenizer(f"error: {new_log}", return_tensors="pt").to(device)
+    with torch.no_grad():
+        output = fix_model.generate(
+            **inputs,
+            min_length=10,
+            max_length=1160,
+            num_return_sequences=1,
+            num_beams=12,
+            repetition_penalty=4.0,
+            early_stopping=True
+        )
+    fix = tokenizer.decode(output[0], skip_special_tokens=True)
+
+    print("\nFailure found:")
+    print(f"New Log: {new_log}")
+    print(f"Similar Failure: {closest_known_error}")
+    print(f"Suggested Fix: {fix}")
+
+logs = [
+    "make: *** [all] Error 1",
+    "# ** Error: (vlog-7033) Unresolved reference to 'rst' in module 'top_module'"
+]
+for failure in logs:
+    analyze_log(failure)
